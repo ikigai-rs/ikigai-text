@@ -445,7 +445,7 @@ pub fn rev() -> FnEndpoint {
 
 // --- the library as a mountable space --------------------------------------
 
-/// The text-tool library as a mountable [`EndpointSpace`], binding every
+/// The text-tool library as a mountable [`EndpointSpace`](ikigai_core::EndpointSpace), binding every
 /// endpoint at its conventional `urn:text:*` IRI. A host mounts this and chains
 /// its own bindings on top (`EndpointSpace::bind` is a builder):
 ///
