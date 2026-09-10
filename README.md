@@ -43,9 +43,20 @@ an error (a mistyped flag never silently reads as off). `uniq` collapses only
 *adjacent* duplicates (Unix semantics) — pipe through `sort` first for a global
 dedup.
 
-Each endpoint authors a full self-description — `one_of` for the enums, XSD
-`class` for the scalars, `default` where applicable — so that each projects to a
+Each endpoint authors a full self-description — an XSD `class` on every input,
+`one_of` for the enums, `default` where applicable — so that each projects to a
 well-typed, MCP-legible tool once the action manifold is projected.
+
+## Conformance
+
+The module **passes
+[`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)** with
+no opt-outs: `tests/conformance.rs` walks every `urn:text:*` endpoint and runs
+every check (ArgSpec completeness, declared = enforced, cacheability, pipeline
+citizenship, naming). Every endpoint is declared `pure` there — it reads nothing
+but its inline arguments, so its cacheable result rightly has no golden thread —
+and `cacheable`, so a future dependency that silently downgraded the effective
+expiry would fail the test rather than slow every read.
 
 ## Usage
 

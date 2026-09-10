@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-text"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) for ikigai — pure, cacheable, wasm-clean pipeline citizens that make the REPL a coreutils analog."
@@ -20,3 +20,6 @@ ikigai-core = "0.1.37"
 
 [dev-dependencies]
 futures = "0.3"
+# The module recipe as one test (`tests/conformance.rs`): walks every bound
+# endpoint and reports every violation at once. 0.1.0 is the first release.
+ikigai-conformance = "0.1.0"

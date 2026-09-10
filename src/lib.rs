@@ -30,10 +30,14 @@
 //!
 //! ## ArgSpec showcase
 //!
-//! Each endpoint authors a full self-description — `one_of` for enums, XSD
-//! `class` for scalars, `default` where applicable — so that each becomes a
-//! well-typed, MCP-projectable tool once the manifold is projected. The
-//! `describe` tests assert those declarations directly.
+//! Each endpoint authors a full self-description — an XSD `class` on every
+//! input, `one_of` for enums, `default` where applicable — so that each becomes
+//! a well-typed, MCP-projectable tool once the manifold is projected. The
+//! `describe` tests assert those declarations directly, and
+//! `tests/conformance.rs` runs `ikigai-conformance` over the whole space: every
+//! endpoint is declared `pure` there (a pure function needs no golden thread)
+//! and `cacheable` (so a dependency that silently downgraded the expiry would
+//! be a red test).
 
 use ikigai_core::{
     ArgSpec, Description, Error, Exact, FnEndpoint, Invocation, ReprType, Representation, Result,
@@ -48,6 +52,9 @@ fn text_plain_utf8() -> ReprType {
 /// The same media type as a description-output string.
 const TEXT_PLAIN_UTF8: &str = "text/plain;charset=utf-8";
 
+/// The XSD `string` datatype IRI — the `class` of the piped input and of every
+/// free-text or enum-token argument.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// The XSD `integer` datatype IRI — the `class` of a line-count argument.
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 /// The XSD `boolean` datatype IRI — the `class` of a flag argument.
@@ -100,7 +107,9 @@ fn input<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
 
 /// The `in` ArgSpec — the piped, line-oriented input shared by every endpoint.
 fn in_lines() -> ArgSpec {
-    ArgSpec::new("in").summary("the input text (piped); treated as newline-separated lines")
+    ArgSpec::new("in")
+        .summary("the input text (piped); treated as newline-separated lines")
+        .class(XSD_STRING)
 }
 
 // --- wc --------------------------------------------------------------------
@@ -139,6 +148,7 @@ pub fn wc() -> FnEndpoint {
             .input(
                 ArgSpec::new("count")
                     .summary("what to count: lines, words, or bytes")
+                    .class(XSD_STRING)
                     .one_of(["lines", "words", "bytes"])
                     .default_value("lines"),
             )
@@ -239,7 +249,11 @@ pub fn grep() -> FnEndpoint {
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .input(in_lines())
-            .input(ArgSpec::new("pattern").summary("the literal substring to search for"))
+            .input(
+                ArgSpec::new("pattern")
+                    .summary("the literal substring to search for")
+                    .class(XSD_STRING),
+            )
             .input(
                 ArgSpec::new("i")
                     .summary("match case-insensitively")
@@ -815,6 +829,7 @@ mod tests {
     fn wc_describes_its_count_enum_and_default() {
         let d = describe(&wc());
         let count = arg(&d, "count");
+        assert_eq!(count.class.as_deref(), Some(XSD_STRING));
         assert_eq!(count.one_of, vec!["lines", "words", "bytes"]);
         assert_eq!(count.default.as_deref(), Some("lines"));
         assert!(!count.required, "an argument with a default is optional");
@@ -838,6 +853,7 @@ mod tests {
     fn grep_declares_a_required_pattern_and_boolean_flags() {
         let d = describe(&grep());
         assert!(arg(&d, "pattern").required, "pattern is required");
+        assert_eq!(arg(&d, "pattern").class.as_deref(), Some(XSD_STRING));
         for name in ["i", "v"] {
             let f = arg(&d, name);
             assert_eq!(f.class.as_deref(), Some(XSD_BOOLEAN));
@@ -877,6 +893,18 @@ mod tests {
             assert!(d.verbs.contains(&Verb::Source), "{} sources", d.id);
             assert!(d.verbs.contains(&Verb::Meta), "{} self-describes", d.id);
             assert!(!d.summary.is_empty(), "{} has a summary", d.id);
+            // The piped input is typed text on every endpoint.
+            assert_eq!(
+                arg(&d, "in").class.as_deref(),
+                Some(XSD_STRING),
+                "{} types its piped input",
+                d.id
+            );
+            // Every input carries a class — the ARGSPECS rule the conformance
+            // suite mechanizes, pinned here per endpoint as well.
+            for input in &d.inputs {
+                assert!(input.class.is_some(), "{}.{} has a class", d.id, input.name);
+            }
             assert_eq!(
                 d.outputs,
                 vec![TEXT_PLAIN_UTF8.to_string()],
