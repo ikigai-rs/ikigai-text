@@ -459,6 +459,9 @@ pub fn rev() -> FnEndpoint {
 
 // --- the library as a mountable space --------------------------------------
 
+/// The name [`space`] claims: `urn:iki:space:text`.
+pub const SPACE_ID: &str = "urn:iki:space:text";
+
 /// The text-tool library as a mountable [`EndpointSpace`](ikigai_core::EndpointSpace), binding every
 /// endpoint at its conventional `urn:text:*` IRI. A host mounts this and chains
 /// its own bindings on top (`EndpointSpace::bind` is a builder):
@@ -470,6 +473,10 @@ pub fn rev() -> FnEndpoint {
 ///
 /// Hosts that want different IRIs (binding authority is a host concern) can
 /// instead pull the individual constructors and bind them as they like.
+///
+/// The space is configuration-free, so it names itself [`SPACE_ID`]. A host that
+/// binds more doors on top gets an anonymous space (the extended space no longer
+/// holds the same doors) and names it itself if it wants a name.
 pub fn space() -> ikigai_core::EndpointSpace {
     ikigai_core::EndpointSpace::new()
         .bind(Exact::new("urn:text:wc"), wc())
@@ -480,6 +487,7 @@ pub fn space() -> ikigai_core::EndpointSpace {
         .bind(Exact::new("urn:text:uniq"), uniq())
         .bind(Exact::new("urn:text:nl"), nl())
         .bind(Exact::new("urn:text:rev"), rev())
+        .named(ikigai_core::space_iri("text"))
 }
 
 #[cfg(test)]

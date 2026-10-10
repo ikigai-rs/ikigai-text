@@ -12,7 +12,8 @@
 //!   effective expiry into a red test instead of a ~2000× slowdown.
 //!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
-//! opt-outs, no module namespace (there is no RDF face).
+//! opt-outs, no module namespace (there is no RDF face). One space declaration:
+//! `space()` is self-named `urn:iki:space:text`.
 
 use ikigai_conformance::Suite;
 use ikigai_core::Kernel;
@@ -26,7 +27,10 @@ fn conforms() {
     let kernel = Kernel::new(Arc::new(ikigai_text::space()));
     let suite = ENDPOINTS
         .iter()
-        .fold(Suite::new(), |suite, id| suite.pure(*id).cacheable(*id));
+        .fold(Suite::new(), |suite, id| suite.pure(*id).cacheable(*id))
+        // `space()` is configuration-free, so it names itself; the suite calls
+        // it twice and holds both calls to the same name over the same doors.
+        .self_named_space("text", ikigai_text::space);
     let report = suite.run_blocking(&kernel);
     assert!(report.is_clean(), "{report}");
     // The walk saw exactly the endpoints declared above. A ninth tool bound
@@ -43,5 +47,9 @@ fn conforms() {
         report.actions,
         ENDPOINTS.len(),
         "one Source action per endpoint: {report}"
+    );
+    assert_eq!(
+        ikigai_core::space_iri("text").as_str(),
+        ikigai_text::SPACE_ID
     );
 }

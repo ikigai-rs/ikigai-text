@@ -14,12 +14,14 @@ categories = ["wasm", "text-processing"]
 [dependencies]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.1.37 is the ArgSpec/ActionSpec era: this crate leans on ArgSpec::one_of /
-# default_value / class to author MCP-projectable contracts.
-ikigai-core = "0.1.37"
+# 0.1.89 is the floor for `space_iri` (the `urn:iki:space:` convention) and for
+# `bind` dropping a space's name, which `space()` relies on: it names itself LAST.
+# As a 0.x caret this is also a ceiling (<0.2.0).
+ikigai-core = "0.1.89"
 
 [dev-dependencies]
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
-# endpoint and reports every violation at once. 0.1.0 is the first release.
-ikigai-conformance = "0.2.0"
+# endpoint and reports every violation at once. 0.6.0 is the first release with
+# SPACE-NAME (`self_named_space`); as a 0.x caret it is also a ceiling (<0.7.0).
+ikigai-conformance = "0.6.0"
