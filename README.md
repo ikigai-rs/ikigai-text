@@ -72,6 +72,9 @@ let space = ikigai_text::space()
 let kernel = Kernel::new(Arc::new(space));
 ```
 
+`space()` names itself `urn:iki:space:text`, exported as `ikigai_text::SPACE_ID`
+(binding more doors on top, as above, drops the name: the host names its extension).
+
 Or pull the individual constructors (`ikigai_text::grep()`, …) and bind them at
 IRIs of your choosing — binding authority is a host concern.
 
