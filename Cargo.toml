@@ -22,6 +22,8 @@ ikigai-core = "0.1.89"
 [dev-dependencies]
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
-# endpoint and reports every violation at once. 0.6.0 is the first release with
-# SPACE-NAME (`self_named_space`); as a 0.x caret it is also a ceiling (<0.7.0).
-ikigai-conformance = "0.6.0"
+# endpoint and reports every violation at once. 0.8.0 is the first release with
+# REQUIRED (each required `in`, and grep's `pattern`, dropped must be refused
+# typed) on top of 0.7.0's VALIDATE and 0.6.0's SPACE-NAME (`self_named_space`);
+# as a 0.x caret it is also a ceiling (<0.9.0).
+ikigai-conformance = "0.8.0"
