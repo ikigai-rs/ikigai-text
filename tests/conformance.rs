@@ -11,6 +11,10 @@
 //!   suite to that turns a future dependency that silently downgraded the
 //!   effective expiry into a red test instead of a ~2000× slowdown.
 //!
+//! REQUIRED (0.8.0) drops each required input in turn (`in` on all eight, and
+//! grep's `pattern`) and holds the call to a typed `MissingArgument`; every
+//! tool reads them with `inline_str(…)?`, which refuses exactly that way.
+//!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
 //! opt-outs, no module namespace (there is no RDF face). One space declaration:
 //! `space()` is self-named `urn:iki:space:text`.
