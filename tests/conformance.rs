@@ -15,6 +15,10 @@
 //! grep's `pattern`) and holds the call to a typed `MissingArgument`; every
 //! tool reads them with `inline_str(…)?`, which refuses exactly that way.
 //!
+//! DATATYPES and FAILURES (on by default since 0.11.0) run with no waiver:
+//! there is no Turtle face to type a literal in, and no action states failure
+//! classes (the report says FAILURES compared nothing), so both are clean.
+//!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
 //! opt-outs, no module namespace (there is no RDF face). One space declaration:
 //! `space()` is self-named `urn:iki:space:text`.
