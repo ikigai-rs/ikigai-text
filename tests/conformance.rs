@@ -16,8 +16,12 @@
 //! tool reads them with `inline_str(…)?`, which refuses exactly that way.
 //!
 //! DATATYPES and FAILURES (on by default since 0.11.0) run with no waiver:
-//! there is no Turtle face to type a literal in, and no action states failure
-//! classes (the report says FAILURES compared nothing), so both are clean.
+//! there is no Turtle face to type a literal in, and every tool declares
+//! `over-budget` (a streamed `in` past the run's byte budget is refused, ledger
+//! #2275) beside the implied `permanent`, which is all the walk can observe.
+//!
+//! The walk passes `in` inline, the bytes path. The body path (a referenced,
+//! streamed `in`) is held to the bytes answer in `tests/streaming.rs`.
 //!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
 //! opt-outs, no module namespace (there is no RDF face). One space declaration:

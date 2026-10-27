@@ -1,7 +1,7 @@
 //! `ikigai-text` — Unix-like text endpoints as pure pipeline citizens.
 //!
 //! A standalone **ikigai module crate** (like `ikigai-fn`): a host links it in
-//! and mounts [`space`], rather than the engine shipping the behaviour itself.
+//! and mounts [`space`], rather than the engine shipping the behavior itself.
 //! It depends only on the published `ikigai-core` kernel, uses no OS or platform
 //! APIs, and compiles to `wasm32-unknown-unknown` — so the same module links
 //! into a native CLI and an in-browser WebAssembly host alike.
@@ -28,6 +28,36 @@
 //!   representation is [`Representation::cacheable`]: identical input, identical
 //!   output, cached under the kernel's capability-fingerprinted key.
 //!
+//! ## Streaming (ledger #2275)
+//!
+//! Each tool answers two ways. The bytes path ([`Endpoint::invoke`]) reads an
+//! inline `in` whole, as it always has. The body path
+//! ([`Endpoint::invoke_body`], what the kernel calls) reads `in` with
+//! [`Invocation::content_body`], so `in` may also be a reference or a content id,
+//! and a streamed input is answered as a stream, line by line, never held whole:
+//!
+//! - `head` stops after `n` lines and drops its producer, so it never reads the
+//!   rest of the input;
+//! - `wc`, `grep`, `nl`, `rev` and `uniq` hold one line at a time;
+//! - `tail` holds at most `n` lines;
+//! - `sort` needs every line, so it collects the input under the run's byte
+//!   budget ([`Invocation::collect`]).
+//!
+//! The input is decoded incrementally with std's UTF-8 validator, one line at a
+//! time (a line split across chunks is joined first, and `\n` is never inside a
+//! multi-byte sequence). Invalid UTF-8 is refused (`InvalidArgument` on `in`),
+//! never replaced. A line, or `tail`'s held lines, longer than what is left of
+//! the run's byte budget (`urn:cap:stream:memory:<bytes>`) ends the answer with
+//! [`Error::OverBudget`]; a failing input ends it with the input's error. A
+//! streamed answer never ends cleanly short.
+//!
+//! A one-shot input gives a one-shot answer (never stored by the kernel); an
+//! input that can be read again ([`Body::Replay`]) gives an answer that can be
+//! read again, each reader re-reading the input. Collected, the body answer
+//! equals the bytes answer for the same input. Because `head` stops reading, it
+//! answers over an input whose invalid UTF-8 lies past its `n` lines, as Unix
+//! `head` does; the bytes path, which is handed the input whole, refuses it.
+//!
 //! ## ArgSpec showcase
 //!
 //! Each endpoint authors a full self-description — an XSD `class` on every
@@ -39,9 +69,14 @@
 //! and `cacheable` (so a dependency that silently downgraded the expiry would
 //! be a red test).
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt};
 use ikigai_core::{
-    ArgSpec, Description, Error, Exact, FnEndpoint, Invocation, ReprType, Representation, Result,
-    Verb,
+    ArgRef, ArgSpec, Body, ByteStream, Bytes, Description, Endpoint, Error, Exact, FailureClass,
+    Invocation, Replay, ReprType, Representation, Result, Verb,
 };
 
 /// The conventional `text/plain; charset=utf-8` representation type.
@@ -108,168 +143,652 @@ fn input<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
 /// The `in` ArgSpec — the piped, line-oriented input shared by every endpoint.
 fn in_lines() -> ArgSpec {
     ArgSpec::new("in")
-        .summary("the input text (piped); treated as newline-separated lines")
+        .summary(
+            "the input text (piped; inline, by reference, or by content id); treated as \
+             newline-separated lines",
+        )
         .class(XSD_STRING)
+}
+
+/// `in` that is not valid UTF-8, refused (never replaced), naming the byte offset.
+fn not_utf8(at: u64) -> Error {
+    Error::InvalidArgument {
+        name: "in".to_string(),
+        detail: format!("not valid UTF-8 (at byte {at})"),
+    }
+}
+
+/// More held than the run's byte budget had left when the answer began.
+fn over_budget(what: &str, held: usize, limit: u64) -> Error {
+    Error::OverBudget {
+        detail: format!(
+            "{what} holds at least {held} byte(s), more than the {limit} byte(s) left of the \
+             run's byte budget (a `urn:cap:stream:memory:<bytes>` grant raises it, up to the \
+             host's ceiling)"
+        ),
+    }
+}
+
+// --- the line tools, one line at a time ------------------------------------
+
+/// What `wc` counts.
+#[derive(Clone, Copy)]
+enum Count {
+    Lines,
+    Words,
+    Bytes,
+}
+
+/// A line tool with its arguments read: everything but `sort`, which needs the
+/// whole input. Both paths run it through one [`Pass`], so they answer alike.
+#[derive(Clone)]
+enum LineOp {
+    Wc(Count),
+    Head(usize),
+    Tail(usize),
+    Grep {
+        pattern: String,
+        /// The needle, lower-cased once, when matching case-insensitively.
+        lowered: Option<String>,
+        invert: bool,
+    },
+    Uniq {
+        counts: bool,
+    },
+    Nl,
+    Rev,
+}
+
+/// One pass of a [`LineOp`] over the input's lines: fed a line at a time, it
+/// appends its output to `out` (newline-joined, no trailing newline).
+struct Pass {
+    op: LineOp,
+    /// The most bytes the pass may hold (`tail`'s lines).
+    limit: u64,
+    /// Lines (or words) counted, lines kept by `head`, or `nl`'s last number.
+    seen: u64,
+    /// `tail`'s last lines, and their total length.
+    kept: VecDeque<String>,
+    kept_bytes: usize,
+    /// `uniq`'s current run of equal lines.
+    run: Option<(String, u64)>,
+    /// Output not yet handed out.
+    out: String,
+    /// Whether anything has been written, so the next line needs a separator.
+    started: bool,
+}
+
+impl Pass {
+    fn new(op: LineOp, limit: u64) -> Self {
+        Pass {
+            op,
+            limit,
+            seen: 0,
+            kept: VecDeque::new(),
+            kept_bytes: 0,
+            run: None,
+            out: String::new(),
+            started: false,
+        }
+    }
+
+    /// Whether another line could change the answer: `false` once `head` has
+    /// its `n` lines, so the reader stops and drops its producer.
+    fn wants_more(&self) -> bool {
+        match self.op {
+            LineOp::Head(n) => self.seen < n as u64,
+            _ => true,
+        }
+    }
+
+    /// Write one output line.
+    fn emit(&mut self, line: &str) {
+        if self.started {
+            self.out.push('\n');
+        }
+        self.started = true;
+        self.out.push_str(line);
+    }
+
+    /// Feed the next input line.
+    fn line(&mut self, line: &str) -> Result<()> {
+        match &self.op {
+            LineOp::Wc(Count::Lines) => self.seen += 1,
+            LineOp::Wc(Count::Words) => self.seen += line.split_whitespace().count() as u64,
+            LineOp::Wc(Count::Bytes) => {}
+            LineOp::Head(_) => {
+                self.seen += 1;
+                self.emit(line);
+            }
+            LineOp::Tail(n) => {
+                let n = *n;
+                if n == 0 {
+                    return Ok(());
+                }
+                if self.kept.len() == n {
+                    if let Some(dropped) = self.kept.pop_front() {
+                        self.kept_bytes -= dropped.len();
+                    }
+                }
+                self.kept_bytes += line.len();
+                if self.kept_bytes as u64 > self.limit {
+                    return Err(over_budget("tail", self.kept_bytes, self.limit));
+                }
+                self.kept.push_back(line.to_string());
+            }
+            LineOp::Grep {
+                pattern,
+                lowered,
+                invert,
+            } => {
+                let hit = match lowered {
+                    Some(needle) => line.to_lowercase().contains(needle.as_str()),
+                    None => line.contains(pattern.as_str()),
+                };
+                if hit != *invert {
+                    self.emit(line);
+                }
+            }
+            LineOp::Uniq { counts } => {
+                let counts = *counts;
+                match &mut self.run {
+                    Some((prev, n)) if prev == line => *n += 1,
+                    _ => {
+                        if let Some((prev, n)) = self.run.take() {
+                            self.emit(&emit_uniq(&prev, n, counts));
+                        }
+                        self.run = Some((line.to_string(), 1));
+                    }
+                }
+            }
+            LineOp::Nl => {
+                self.seen += 1;
+                let numbered = format!("{:>6}\t{line}", self.seen);
+                self.emit(&numbered);
+            }
+            LineOp::Rev => {
+                let reversed: String = line.chars().rev().collect();
+                self.emit(&reversed);
+            }
+        }
+        Ok(())
+    }
+
+    /// The input has ended after `total` bytes: write what was held back.
+    fn finish(&mut self, total: u64) {
+        match self.op {
+            LineOp::Wc(Count::Bytes) => self.out = total.to_string(),
+            LineOp::Wc(_) => self.out = self.seen.to_string(),
+            LineOp::Tail(_) => {
+                for line in std::mem::take(&mut self.kept) {
+                    self.emit(&line);
+                }
+                self.kept_bytes = 0;
+            }
+            LineOp::Uniq { counts } => {
+                if let Some((prev, n)) = self.run.take() {
+                    self.emit(&emit_uniq(&prev, n, counts));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The output written since the last take.
+    fn take(&mut self) -> String {
+        std::mem::take(&mut self.out)
+    }
+
+    /// The whole answer over an input already in memory: the bytes path.
+    fn over_str(op: LineOp, text: &str) -> Result<String> {
+        let mut pass = Pass::new(op, u64::MAX);
+        for line in text.lines() {
+            if !pass.wants_more() {
+                break;
+            }
+            pass.line(line)?;
+        }
+        if pass.wants_more() {
+            pass.finish(text.len() as u64);
+        }
+        Ok(pass.take())
+    }
+}
+
+/// Splits a stream of chunks into lines exactly as [`str::lines`] splits a
+/// whole string, validating each line with std's UTF-8 validator.
+struct Splitter {
+    /// The start of a line whose end has not arrived yet.
+    pending: Vec<u8>,
+    /// The input offset `pending` starts at, for the error's offset.
+    start: u64,
+    /// The longest line it may hold.
+    limit: u64,
+}
+
+impl Splitter {
+    fn new(limit: u64) -> Self {
+        Splitter {
+            pending: Vec::new(),
+            start: 0,
+            limit,
+        }
+    }
+
+    /// One line's bytes, decoded.
+    fn decode(bytes: &[u8], at: u64) -> Result<&str> {
+        std::str::from_utf8(bytes).map_err(|e| not_utf8(at + e.valid_up_to() as u64))
+    }
+
+    /// Feed `chunk`, handing each complete line to `pass` while it wants more.
+    fn feed(&mut self, mut chunk: &[u8], pass: &mut Pass) -> Result<()> {
+        while pass.wants_more() {
+            let Some(end) = chunk.iter().position(|&b| b == b'\n') else {
+                self.pending.extend_from_slice(chunk);
+                if self.pending.len() as u64 > self.limit {
+                    return Err(over_budget("a line", self.pending.len(), self.limit));
+                }
+                return Ok(());
+            };
+            let (segment, rest) = (&chunk[..end], &chunk[end + 1..]);
+            chunk = rest;
+            // A line is refused past the limit even when it arrived whole: a
+            // tool copies it (`rev`, `tail`, `uniq`), and the answer must not
+            // depend on where the producer cut its chunks.
+            let len = self.pending.len() + segment.len();
+            if len as u64 > self.limit {
+                return Err(over_budget("a line", len, self.limit));
+            }
+            let at = self.start;
+            self.start += (segment.len() + self.pending.len() + 1) as u64;
+            // `str::lines` drops a `\r` before the `\n`.
+            let strip = |line: &[u8]| -> usize { line.len() - usize::from(line.ends_with(b"\r")) };
+            if self.pending.is_empty() {
+                pass.line(Self::decode(&segment[..strip(segment)], at)?)?;
+            } else {
+                self.pending.extend_from_slice(segment);
+                let line = std::mem::take(&mut self.pending);
+                pass.line(Self::decode(&line[..strip(&line)], at)?)?;
+                // Keep the allocation for the next long line.
+                self.pending = line;
+                self.pending.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// The input has ended: the last line, when it had no newline.
+    fn finish(&mut self, pass: &mut Pass) -> Result<()> {
+        let rest = std::mem::take(&mut self.pending);
+        for line in Self::decode(&rest, self.start)?.lines() {
+            if !pass.wants_more() {
+                break;
+            }
+            pass.line(line)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads a streamed input for one [`Pass`].
+struct Reader {
+    /// The producer, dropped as soon as nothing more is wanted from it.
+    input: Option<ByteStream>,
+    split: Splitter,
+    pass: Pass,
+    /// Bytes read from the input, for `wc count=bytes`.
+    total: u64,
+    done: bool,
+}
+
+impl Reader {
+    /// The next output chunk; `None` once the answer is complete. An error item
+    /// is the last item.
+    async fn next_chunk(&mut self) -> Option<Result<Bytes>> {
+        loop {
+            if self.done {
+                return None;
+            }
+            let Some(input) = self.input.as_mut() else {
+                self.done = true;
+                let out = self.pass.take();
+                return (!out.is_empty()).then(|| Ok(Bytes::from(out)));
+            };
+            if !self.pass.wants_more() {
+                // `head` has its lines: drop the producer without reading on.
+                self.input = None;
+                continue;
+            }
+            let step = match input.next().await {
+                Some(Ok(chunk)) => {
+                    self.total += chunk.len() as u64;
+                    self.split.feed(&chunk, &mut self.pass)
+                }
+                Some(Err(error)) => Err(error),
+                None => {
+                    self.input = None;
+                    let ended = self.split.finish(&mut self.pass);
+                    if ended.is_ok() && self.pass.wants_more() {
+                        self.pass.finish(self.total);
+                    }
+                    ended
+                }
+            };
+            if let Err(error) = step {
+                self.input = None;
+                self.done = true;
+                return Some(Err(error));
+            }
+            if !self.pass.wants_more() {
+                self.input = None;
+            }
+            let out = self.pass.take();
+            if !out.is_empty() {
+                return Some(Ok(Bytes::from(out)));
+            }
+        }
+    }
+}
+
+/// The answer of `op` over a streamed `input`, as a stream.
+fn lines_stream(input: ByteStream, op: LineOp, limit: u64) -> ByteStream {
+    let reader = Reader {
+        input: Some(input),
+        split: Splitter::new(limit),
+        pass: Pass::new(op, limit),
+        total: 0,
+        done: false,
+    };
+    Box::pin(stream::unfold(reader, |mut reader| async move {
+        let item = reader.next_chunk().await?;
+        Some((item, reader))
+    }))
+}
+
+/// The answer of `op` over an input that can be read again: each reader
+/// re-reads the input.
+struct LinesReplay {
+    input: Arc<dyn Replay>,
+    op: LineOp,
+    limit: u64,
+}
+
+impl Replay for LinesReplay {
+    fn open(&self) -> ByteStream {
+        lines_stream(self.input.open(), self.op.clone(), self.limit)
+    }
+}
+
+// --- the endpoints ---------------------------------------------------------
+
+/// Which text tool a [`TextTool`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tool {
+    Wc,
+    Head,
+    Tail,
+    Grep,
+    Sort,
+    Uniq,
+    Nl,
+    Rev,
+}
+
+/// One `urn:text:*` endpoint (what [`wc`], [`head`], … build): answers the
+/// bytes path from an inline `in`, and the body path from `in` in any form,
+/// streaming it (see the crate documentation).
+pub struct TextTool {
+    tool: Tool,
+}
+
+impl TextTool {
+    /// The tool's arguments read, but for `in`: a [`LineOp`], or `None` for `sort`.
+    fn line_op(&self, inv: &Invocation<'_>) -> Result<Option<LineOp>> {
+        Ok(Some(match self.tool {
+            Tool::Wc => LineOp::Wc(match inv.inline_str("count").unwrap_or("lines") {
+                "lines" => Count::Lines,
+                "words" => Count::Words,
+                "bytes" => Count::Bytes,
+                other => {
+                    return Err(Error::InvalidArgument {
+                        name: "count".to_string(),
+                        detail: format!("expected one of lines|words|bytes, got {other:?}"),
+                    })
+                }
+            }),
+            Tool::Head => LineOp::Head(count_arg(inv, "n", 10)?),
+            Tool::Tail => LineOp::Tail(count_arg(inv, "n", 10)?),
+            Tool::Grep => {
+                let pattern = inv.inline_str("pattern")?.to_string();
+                let case_insensitive = flag(inv, "i")?;
+                let invert = flag(inv, "v")?;
+                LineOp::Grep {
+                    lowered: case_insensitive.then(|| pattern.to_lowercase()),
+                    pattern,
+                    invert,
+                }
+            }
+            Tool::Uniq => LineOp::Uniq {
+                counts: flag(inv, "c")?,
+            },
+            Tool::Nl => LineOp::Nl,
+            Tool::Rev => LineOp::Rev,
+            Tool::Sort => return Ok(None),
+        }))
+    }
+
+    /// The answer over the whole input `text`, once `in` is known valid.
+    fn over_str(&self, inv: &Invocation<'_>, text_in: &str) -> Result<Representation> {
+        match self.line_op(inv)? {
+            Some(op) => Pass::over_str(op, text_in).map(text),
+            None => sort_str(inv, text_in),
+        }
+    }
+}
+
+#[async_trait]
+impl Endpoint for TextTool {
+    /// The bytes path: an inline `in` read whole, as before bodies existed. A
+    /// referenced `in` is answered through the body path and collected under
+    /// the run's byte budget.
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !matches!(inv.request.args.get("in"), None | Some(ArgRef::Inline(_))) {
+            let body = self.invoke_body(inv).await?;
+            return match inv.memory_budget() {
+                Some(budget) => body.collect_within(budget).await,
+                None => {
+                    body.collect(ikigai_core::DEFAULT_STREAM_MEMORY as usize)
+                        .await
+                }
+            };
+        }
+        self.over_str(inv, input(inv)?)
+    }
+
+    /// The body path: `in` read with [`Invocation::content_body`], a streamed one
+    /// answered as a stream (see the crate documentation).
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        if matches!(inv.request.args.get("in"), None | Some(ArgRef::Inline(_))) {
+            return self.invoke(inv).await.map(Representation::into_body);
+        }
+        let op = self.line_op(inv)?;
+        let body = inv.content_body("in").await?;
+        let limit = inv
+            .memory_budget()
+            .map_or(ikigai_core::DEFAULT_STREAM_MEMORY, |budget| {
+                budget.remaining()
+            });
+        let answer = match (op, body) {
+            (_, Body::Bytes(bytes)) => {
+                let text_in = Splitter::decode(&bytes, 0)?;
+                return self.over_str(inv, text_in).map(Representation::into_body);
+            }
+            (None, body) => {
+                let bytes = inv.collect(body).await?;
+                let text_in = Splitter::decode(&bytes, 0)?;
+                return sort_str(inv, text_in).map(Representation::into_body);
+            }
+            (Some(op), Body::Replay(input)) => Body::replay(LinesReplay { input, op, limit }),
+            (Some(op), Body::Once(input)) => Body::Once(lines_stream(input, op, limit)),
+        };
+        Ok(Representation::from_body(text_plain_utf8(), answer).cacheable())
+    }
+
+    fn name(&self) -> &str {
+        match self.tool {
+            Tool::Wc => "wc",
+            Tool::Head => "head",
+            Tool::Tail => "tail",
+            Tool::Grep => "grep",
+            Tool::Sort => "sort",
+            Tool::Uniq => "uniq",
+            Tool::Nl => "nl",
+            Tool::Rev => "rev",
+        }
+    }
+
+    fn describe(&self) -> Description {
+        let description = match self.tool {
+            Tool::Wc => wc_description(),
+            Tool::Head => head_description(),
+            Tool::Tail => tail_description(),
+            Tool::Grep => grep_description(),
+            Tool::Sort => sort_description(),
+            Tool::Uniq => uniq_description(),
+            Tool::Nl => nl_description(),
+            Tool::Rev => rev_description(),
+        };
+        // A streamed `in` past the run's byte budget (a line too long, `tail`'s
+        // lines, `sort`'s whole input) is refused, never truncated.
+        description.fails(FailureClass::OverBudget)
+    }
 }
 
 // --- wc --------------------------------------------------------------------
 
-fn wc_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let text_in = input(inv)?;
-    let count = match inv.inline_str("count").unwrap_or("lines") {
-        "lines" => text_in.lines().count(),
-        "words" => text_in.split_whitespace().count(),
-        "bytes" => text_in.len(),
-        other => {
-            return Err(Error::InvalidArgument {
-                name: "count".to_string(),
-                detail: format!("expected one of lines|words|bytes, got {other:?}"),
-            })
-        }
-    };
-    Ok(text(count.to_string()))
+fn wc_description() -> Description {
+    Description::new("wc")
+        .title("Word/line/byte count")
+        .summary(
+            "Counts the input's lines (default), words, or bytes and returns the single \
+             count as a number. `count=words` counts whitespace-separated runs; \
+             `count=bytes` is the UTF-8 byte length.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("count")
+                .summary("what to count: lines, words, or bytes")
+                .class(XSD_STRING)
+                .one_of(["lines", "words", "bytes"])
+                .default_value("lines"),
+        )
+        .output(TEXT_PLAIN_UTF8)
 }
 
 /// `wc`: counts lines (default), words, or bytes of the input — the single
 /// count, as a number. Lines are logical lines ([`str::lines`]); words are
-/// whitespace-separated runs; bytes is the UTF-8 byte length.
-pub fn wc() -> FnEndpoint {
-    FnEndpoint::new("wc", wc_impl).with_description(
-        Description::new("wc")
-            .title("Word/line/byte count")
-            .summary(
-                "Counts the input's lines (default), words, or bytes and returns the single \
-                 count as a number. `count=words` counts whitespace-separated runs; \
-                 `count=bytes` is the UTF-8 byte length.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("count")
-                    .summary("what to count: lines, words, or bytes")
-                    .class(XSD_STRING)
-                    .one_of(["lines", "words", "bytes"])
-                    .default_value("lines"),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+/// whitespace-separated runs; bytes is the UTF-8 byte length. Streamed, it
+/// holds one line at a time.
+pub fn wc() -> TextTool {
+    TextTool { tool: Tool::Wc }
 }
 
 // --- head ------------------------------------------------------------------
 
-fn head_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let n = count_arg(inv, "n", 10)?;
-    let out = input(inv)?.lines().take(n).collect::<Vec<_>>().join("\n");
-    Ok(text(out))
+fn head_description() -> Description {
+    Description::new("head")
+        .title("First lines")
+        .summary(
+            "Returns the first `n` lines of the input (default 10). Streamed, it stops \
+             reading after them.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("n")
+                .summary("how many leading lines to keep")
+                .class(XSD_INTEGER)
+                .default_value("10"),
+        )
+        .output(TEXT_PLAIN_UTF8)
 }
 
-/// `head`: the first `n` lines of the input (default 10).
-pub fn head() -> FnEndpoint {
-    FnEndpoint::new("head", head_impl).with_description(
-        Description::new("head")
-            .title("First lines")
-            .summary("Returns the first `n` lines of the input (default 10).")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("n")
-                    .summary("how many leading lines to keep")
-                    .class(XSD_INTEGER)
-                    .default_value("10"),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+/// `head`: the first `n` lines of the input (default 10). Streamed, it drops
+/// its producer once it has them.
+pub fn head() -> TextTool {
+    TextTool { tool: Tool::Head }
 }
 
 // --- tail ------------------------------------------------------------------
 
-fn tail_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let n = count_arg(inv, "n", 10)?;
-    let all: Vec<&str> = input(inv)?.lines().collect();
-    let start = all.len().saturating_sub(n);
-    Ok(text(all[start..].join("\n")))
+fn tail_description() -> Description {
+    Description::new("tail")
+        .title("Last lines")
+        .summary(
+            "Returns the last `n` lines of the input (default 10). Streamed, it holds at \
+             most `n` lines.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("n")
+                .summary("how many trailing lines to keep")
+                .class(XSD_INTEGER)
+                .default_value("10"),
+        )
+        .output(TEXT_PLAIN_UTF8)
 }
 
-/// `tail`: the last `n` lines of the input (default 10).
-pub fn tail() -> FnEndpoint {
-    FnEndpoint::new("tail", tail_impl).with_description(
-        Description::new("tail")
-            .title("Last lines")
-            .summary("Returns the last `n` lines of the input (default 10).")
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("n")
-                    .summary("how many trailing lines to keep")
-                    .class(XSD_INTEGER)
-                    .default_value("10"),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+/// `tail`: the last `n` lines of the input (default 10). Streamed, it holds at
+/// most `n` lines, under the run's byte budget.
+pub fn tail() -> TextTool {
+    TextTool { tool: Tool::Tail }
 }
 
 // --- grep ------------------------------------------------------------------
 
-fn grep_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let text_in = input(inv)?;
-    let pattern = inv.inline_str("pattern")?;
-    let case_insensitive = flag(inv, "i")?;
-    let invert = flag(inv, "v")?;
-    // Lower-case the needle once when case-insensitive; otherwise match directly.
-    let lowered = case_insensitive.then(|| pattern.to_lowercase());
-    let out = text_in
-        .lines()
-        .filter(|&line| {
-            let hit = match &lowered {
-                Some(needle) => line.to_lowercase().contains(needle.as_str()),
-                None => line.contains(pattern),
-            };
-            hit != invert
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(text(out))
+fn grep_description() -> Description {
+    Description::new("grep")
+        .title("Filter lines by substring")
+        .summary(
+            "Keeps the input lines that contain `pattern` (a literal substring, not a regex). \
+             `i=true` matches case-insensitively; `v=true` inverts the match (keep \
+             non-matching lines).",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("pattern")
+                .summary("the literal substring to search for")
+                .class(XSD_STRING),
+        )
+        .input(
+            ArgSpec::new("i")
+                .summary("match case-insensitively")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .input(
+            ArgSpec::new("v")
+                .summary("invert the match — keep lines NOT containing the pattern")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .output(TEXT_PLAIN_UTF8)
 }
 
 /// `grep`: the lines that contain `pattern` (a **literal substring**, not a
 /// regex in v1). `i=true` matches case-insensitively; `v=true` inverts the test
 /// (keep the lines that do *not* contain it).
-pub fn grep() -> FnEndpoint {
-    FnEndpoint::new("grep", grep_impl).with_description(
-        Description::new("grep")
-            .title("Filter lines by substring")
-            .summary(
-                "Keeps the input lines that contain `pattern` (a literal substring, not a regex). \
-                 `i=true` matches case-insensitively; `v=true` inverts the match (keep \
-                 non-matching lines).",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("pattern")
-                    .summary("the literal substring to search for")
-                    .class(XSD_STRING),
-            )
-            .input(
-                ArgSpec::new("i")
-                    .summary("match case-insensitively")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("v")
-                    .summary("invert the match — keep lines NOT containing the pattern")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+pub fn grep() -> TextTool {
+    TextTool { tool: Tool::Grep }
 }
 
 // --- sort ------------------------------------------------------------------
@@ -280,11 +799,11 @@ fn numeric_key(line: &str) -> f64 {
     line.trim().parse::<f64>().unwrap_or(0.0)
 }
 
-fn sort_impl(inv: &Invocation<'_>) -> Result<Representation> {
+fn sort_str(inv: &Invocation<'_>, text_in: &str) -> Result<Representation> {
     let numeric = flag(inv, "n")?;
     let reverse = flag(inv, "r")?;
     let unique = flag(inv, "u")?;
-    let mut lines: Vec<&str> = input(inv)?.lines().collect();
+    let mut lines: Vec<&str> = text_in.lines().collect();
     if numeric {
         lines.sort_by(|a, b| numeric_key(a).total_cmp(&numeric_key(b)));
     } else {
@@ -300,73 +819,56 @@ fn sort_impl(inv: &Invocation<'_>) -> Result<Representation> {
     Ok(text(lines.join("\n")))
 }
 
+fn sort_description() -> Description {
+    Description::new("sort")
+        .title("Sort lines")
+        .summary(
+            "Sorts the input lines lexically (or numerically with `n=true`, where \
+             non-numeric lines sort as 0). `r=true` reverses the result; `u=true` drops \
+             duplicates globally (dedup after sort). Order of operations: sort, unique, \
+             reverse. A streamed input is collected under the run's byte budget.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("r")
+                .summary("reverse the sort order")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .input(
+            ArgSpec::new("n")
+                .summary("compare numerically instead of lexically")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .input(
+            ArgSpec::new("u")
+                .summary("drop duplicate lines (global, after sorting)")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .output(TEXT_PLAIN_UTF8)
+}
+
 /// `sort`: sorts the input lines. `r=true` reverses, `n=true` compares
 /// numerically (non-numeric lines sort as 0), `u=true` drops duplicates. With
 /// `u`, dedup runs after the sort, so it is global (Unix `sort -u`); ordering is
-/// sort → unique → reverse.
-pub fn sort() -> FnEndpoint {
-    FnEndpoint::new("sort", sort_impl).with_description(
-        Description::new("sort")
-            .title("Sort lines")
-            .summary(
-                "Sorts the input lines lexically (or numerically with `n=true`, where \
-                 non-numeric lines sort as 0). `r=true` reverses the result; `u=true` drops \
-                 duplicates globally (dedup after sort). Order of operations: sort, unique, \
-                 reverse.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("r")
-                    .summary("reverse the sort order")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("n")
-                    .summary("compare numerically instead of lexically")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .input(
-                ArgSpec::new("u")
-                    .summary("drop duplicate lines (global, after sorting)")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+/// sort → unique → reverse. It needs every line, so a streamed input is
+/// collected under the run's byte budget.
+pub fn sort() -> TextTool {
+    TextTool { tool: Tool::Sort }
 }
 
 // --- uniq ------------------------------------------------------------------
 
-fn uniq_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let with_counts = flag(inv, "c")?;
-    let mut out: Vec<String> = Vec::new();
-    let mut run: Option<(&str, usize)> = None;
-    for line in input(inv)?.lines() {
-        match run {
-            Some((prev, n)) if prev == line => run = Some((prev, n + 1)),
-            Some((prev, n)) => {
-                out.push(emit_uniq(prev, n, with_counts));
-                run = Some((line, 1));
-            }
-            None => run = Some((line, 1)),
-        }
-    }
-    if let Some((prev, n)) = run {
-        out.push(emit_uniq(prev, n, with_counts));
-    }
-    Ok(text(out.join("\n")))
-}
-
 /// One `uniq` output line: the line itself, optionally prefixed by its
 /// adjacent-run count and a space.
-fn emit_uniq(line: &str, count: usize, with_counts: bool) -> String {
+fn emit_uniq(line: &str, count: u64, with_counts: bool) -> String {
     if with_counts {
         format!("{count} {line}")
     } else {
@@ -374,87 +876,74 @@ fn emit_uniq(line: &str, count: usize, with_counts: bool) -> String {
     }
 }
 
+fn uniq_description() -> Description {
+    Description::new("uniq")
+        .title("Collapse adjacent duplicates")
+        .summary(
+            "Collapses each run of ADJACENT duplicate lines to a single line (Unix \
+             semantics — pipe through `sort` first for a global dedup). `c=true` prefixes \
+             each line with its run count and a space.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .input(
+            ArgSpec::new("c")
+                .summary("prefix each line with its adjacent-run count")
+                .class(XSD_BOOLEAN)
+                .one_of(["true", "false"])
+                .optional(),
+        )
+        .output(TEXT_PLAIN_UTF8)
+}
+
 /// `uniq`: collapses each run of **adjacent** duplicate lines to one (Unix
 /// semantics — sort first for a global dedup). `c=true` prefixes each line with
 /// its run count and a space.
-pub fn uniq() -> FnEndpoint {
-    FnEndpoint::new("uniq", uniq_impl).with_description(
-        Description::new("uniq")
-            .title("Collapse adjacent duplicates")
-            .summary(
-                "Collapses each run of ADJACENT duplicate lines to a single line (Unix \
-                 semantics — pipe through `sort` first for a global dedup). `c=true` prefixes \
-                 each line with its run count and a space.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .input(
-                ArgSpec::new("c")
-                    .summary("prefix each line with its adjacent-run count")
-                    .class(XSD_BOOLEAN)
-                    .one_of(["true", "false"])
-                    .optional(),
-            )
-            .output(TEXT_PLAIN_UTF8),
-    )
+pub fn uniq() -> TextTool {
+    TextTool { tool: Tool::Uniq }
 }
 
 // --- nl --------------------------------------------------------------------
 
-fn nl_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let out = input(inv)?
-        .lines()
-        .enumerate()
-        .map(|(i, line)| format!("{:>6}\t{line}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(text(out))
+fn nl_description() -> Description {
+    Description::new("nl")
+        .title("Number lines")
+        .summary(
+            "Numbers every input line from 1: a right-aligned (6-wide) number, a tab, then \
+             the line.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .output(TEXT_PLAIN_UTF8)
 }
 
 /// `nl`: numbers every line, from 1 — a right-aligned (6-wide) number, a tab,
 /// then the line.
-pub fn nl() -> FnEndpoint {
-    FnEndpoint::new("nl", nl_impl).with_description(
-        Description::new("nl")
-            .title("Number lines")
-            .summary(
-                "Numbers every input line from 1: a right-aligned (6-wide) number, a tab, then \
-                 the line.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .output(TEXT_PLAIN_UTF8),
-    )
+pub fn nl() -> TextTool {
+    TextTool { tool: Tool::Nl }
 }
 
 // --- rev -------------------------------------------------------------------
 
-fn rev_impl(inv: &Invocation<'_>) -> Result<Representation> {
-    let out = input(inv)?
-        .lines()
-        .map(|line| line.chars().rev().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(text(out))
+fn rev_description() -> Description {
+    Description::new("rev")
+        .title("Reverse characters")
+        .summary(
+            "Reverses the characters (Unicode scalars) of each line; the order of lines is \
+             unchanged.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(in_lines())
+        .output(TEXT_PLAIN_UTF8)
 }
 
 /// `rev`: reverses the characters of each line (by Unicode scalar), line order
 /// unchanged.
-pub fn rev() -> FnEndpoint {
-    FnEndpoint::new("rev", rev_impl).with_description(
-        Description::new("rev")
-            .title("Reverse characters")
-            .summary(
-                "Reverses the characters (Unicode scalars) of each line; the order of lines is \
-                 unchanged.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(in_lines())
-            .output(TEXT_PLAIN_UTF8),
-    )
+pub fn rev() -> TextTool {
+    TextTool { tool: Tool::Rev }
 }
 
 // --- the library as a mountable space --------------------------------------
@@ -523,7 +1012,7 @@ mod tests {
 
     /// The `Description` an endpoint reports through a `Meta` request's routing —
     /// here read straight off the constructor for the declaration assertions.
-    fn describe(ep: &FnEndpoint) -> Description {
+    fn describe(ep: &TextTool) -> Description {
         ep.describe()
     }
 
