@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-text"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) for ikigai — pure, cacheable, wasm-clean pipeline citizens that make the REPL a coreutils analog."
@@ -21,6 +21,11 @@ categories = ["wasm", "text-processing"]
 # space's name, which `space()` relies on: it names itself LAST.
 # As a 0.x caret this is also a ceiling (<0.3.0).
 ikigai-core = "0.2.0"
+# Both already in the graph through ikigai-core: `async-trait` to implement
+# `Endpoint` (its body path, `invoke_body`), `futures-util` to build the streamed
+# answer (ledger #2275). Runtime-free, so the crate stays wasm-clean.
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 futures = "0.3"
