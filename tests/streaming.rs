@@ -499,3 +499,102 @@ fn a_bad_argument_is_refused_before_the_input_is_read() {
     assert!(matches!(answer, Err(Error::InvalidArgument { .. })));
     assert_eq!(polled.load(Ordering::SeqCst), 0);
 }
+
+/// A pipe must hand head the live producer, even when collecting it would
+/// exceed the run's budget. Only the requested prefix should be polled.
+#[test]
+fn attached_head_streams_without_collecting_the_input() {
+    let polled = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let producer = Counted {
+        lines: 1_000_000,
+        polled: Arc::clone(&polled),
+        dropped: Arc::clone(&dropped),
+    };
+    let kernel = kernel_with(producer).with_stream_memory(1024, 1024);
+    let upstream = block_on(kernel.issue_body(
+        Request::new(Verb::Source, Iri::parse(INPUT).unwrap()),
+        &Capability::root(),
+    ))
+    .unwrap();
+    let read = Request::new(Verb::Source, Iri::parse("urn:text:head").unwrap())
+        .with_arg("n", ArgRef::Inline(b"3".to_vec()));
+    let answer = block_on(kernel.issue_with(
+        read,
+        &Capability::root(),
+        ikigai_core::BodyIssue::new().attach("in", upstream.bytes),
+    ))
+    .unwrap();
+    assert_eq!(answer.bytes, b"line 0\nline 1\nline 2");
+    assert_eq!(polled.load(Ordering::SeqCst), 3);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn every_tool_declares_only_its_piped_input_reads_body() {
+    for tool in [
+        ikigai_text::wc(),
+        ikigai_text::head(),
+        ikigai_text::tail(),
+        ikigai_text::grep(),
+        ikigai_text::sort(),
+        ikigai_text::uniq(),
+        ikigai_text::nl(),
+        ikigai_text::rev(),
+    ] {
+        let description = tool.describe();
+        for arg in description.inputs {
+            assert_eq!(
+                arg.reads_body,
+                arg.name == "in",
+                "{}.{}",
+                description.id,
+                arg.name
+            );
+        }
+    }
+}
+
+#[test]
+fn inline_content_id_and_attached_body_answer_alike() {
+    for input in INPUTS {
+        for (tool, args) in CASES {
+            let expected = inline(tool, input.as_bytes(), args).unwrap();
+            let store = Arc::new(ikigai_core::MemoryContentStore::new(1024));
+            let held = store.put(Bytes::copy_from_slice(input.as_bytes())).unwrap();
+            let kernel = Kernel::new(Arc::new(ikigai_text::space())).with_content_store(store);
+            let mut read = Request::new(Verb::Source, Iri::parse(*tool).unwrap());
+            for (name, value) in *args {
+                read = read.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+            }
+            let content = block_on(kernel.issue(
+                read.clone().with_arg("in", ArgRef::Content(held.id())),
+                &Capability::root(),
+            ))
+            .unwrap();
+            assert_eq!(
+                content.bytes, expected,
+                "{tool} {args:?} content id over {input:?}"
+            );
+            for replay in [false, true] {
+                let chunks = Chunks::of(input.as_bytes(), 1);
+                let body = if replay {
+                    Body::replay(chunks)
+                } else {
+                    Body::Once(chunks.stream())
+                };
+                let attached = block_on(kernel.issue_with(
+                    read.clone(),
+                    &Capability::root(),
+                    ikigai_core::BodyIssue::new().attach("in", body),
+                ))
+                .unwrap();
+                assert_eq!(
+                    attached.bytes, expected,
+                    "{tool} {args:?} attached over {input:?} (replay: {replay})"
+                );
+                assert_eq!(attached.repr_type, content.repr_type);
+            }
+        }
+    }
+}

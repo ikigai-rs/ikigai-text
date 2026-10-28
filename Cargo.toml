@@ -14,13 +14,10 @@ categories = ["wasm", "text-processing"]
 [dependencies]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.2.0 is the streams release (ledger #2261); the old "0.1.89" pin meant
-# <0.2.0 under 0.x caret rules, so moving onto it is a deliberate re-pin (and a
-# breaking change for this crate's consumers: core's types are in its API).
-# It carries `space_iri` (the `urn:iki:space:` convention) and `bind` dropping a
-# space's name, which `space()` relies on: it names itself LAST.
-# As a 0.x caret this is also a ceiling (<0.3.0).
-ikigai-core = "0.2.0"
+# 0.2.3 adds ArgSpec::reads_body: a live piped `in` reaches the tool
+# without the kernel collecting it first. This declaration changes all eight
+# text tools' contract IRIs. As a 0.x caret this also sets a ceiling (<0.3.0).
+ikigai-core = "0.2.3"
 # Both already in the graph through ikigai-core: `async-trait` to implement
 # `Endpoint` (its body path, `invoke_body`), `futures-util` to build the streamed
 # answer (ledger #2275). Runtime-free, so the crate stays wasm-clean.

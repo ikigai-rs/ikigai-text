@@ -143,6 +143,7 @@ fn input<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
 /// The `in` ArgSpec — the piped, line-oriented input shared by every endpoint.
 fn in_lines() -> ArgSpec {
     ArgSpec::new("in")
+        .reads_body()
         .summary(
             "the input text (piped; inline, by reference, or by content id); treated as \
              newline-separated lines",
