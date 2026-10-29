@@ -4,7 +4,7 @@
 //! Two declarations, both stated once per endpoint so a newcomer cannot slip in
 //! unlisted:
 //!
-//! - `pure` — every text tool reads nothing but its inline arguments (no file,
+//! - `pure` — every text tool reads nothing but its arguments (no file,
 //!   network, clock or platform read), so its cacheable result rightly carries
 //!   an empty golden-thread set. Nothing ever needs to cut it.
 //! - `cacheable` — every text tool marks its result `.cacheable()`. Holding the
@@ -20,15 +20,17 @@
 //! `over-budget` (a streamed `in` past the run's byte budget is refused, ledger
 //! #2275) beside the implied `permanent`, which is all the walk can observe.
 //!
-//! The walk passes `in` inline, the bytes path. The body path (a referenced,
-//! streamed `in`) is held to the bytes answer in `tests/streaming.rs`.
+//! BODIES compares direct endpoint methods and checks the short collect budget.
+//! BODY-INPUTS compares inline, referenced, stored and attached `in` values,
+//! using the same space and content store as the kernel. More streaming cases
+//! live in `tests/streaming.rs`.
 //!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
 //! opt-outs, no module namespace (there is no RDF face). One space declaration:
 //! `space()` is self-named `urn:iki:space:text`.
 
 use ikigai_conformance::Suite;
-use ikigai_core::Kernel;
+use ikigai_core::{Kernel, MemoryContentStore};
 use std::sync::Arc;
 
 /// Every endpoint `space()` binds, by description id.
@@ -36,15 +38,21 @@ const ENDPOINTS: [&str; 8] = ["wc", "head", "tail", "grep", "sort", "uniq", "nl"
 
 #[test]
 fn conforms() {
-    let kernel = Kernel::new(Arc::new(ikigai_text::space()));
+    let space = Arc::new(ikigai_text::space());
+    let store = Arc::new(MemoryContentStore::new(1024 * 1024));
+    let kernel = Kernel::new(space.clone()).with_content_store(store.clone());
     let suite = ENDPOINTS
         .iter()
         .fold(Suite::new(), |suite, id| suite.pure(*id).cacheable(*id))
         // `space()` is configuration-free, so it names itself; the suite calls
         // it twice and holds both calls to the same name over the same doors.
-        .self_named_space("text", ikigai_text::space);
+        .self_named_space("text", ikigai_text::space)
+        .body_space(space)
+        .body_input_store(store);
     let report = suite.run_blocking(&kernel);
+    println!("{report}");
     assert!(report.is_clean(), "{report}");
+    assert!(report.unprobed.is_empty(), "{report}");
     // The walk saw exactly the endpoints declared above. A ninth tool bound
     // without a `pure`/`cacheable` line would be held to a weaker standard
     // (the suite cannot know which endpoints it was not told about); a

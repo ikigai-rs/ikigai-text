@@ -26,9 +26,6 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`): walks every bound
-# endpoint and reports every violation at once. 0.11.0 is built on core 0.2.0
-# (so the test links one core) and turns DATATYPES and FAILURES on by default,
-# atop 0.10.0's contract-shape checks and RECOMPUTE; as a 0.x caret it is also a
-# ceiling (<0.12.0).
-ikigai-conformance = "0.11.0"
+# The module recipe as one test; 0.12.0 enables BODIES and BODY-INPUTS
+# alongside the existing checks. Its core floor applies only to the test build.
+ikigai-conformance = "0.12.0"
