@@ -598,3 +598,243 @@ fn inline_content_id_and_attached_body_answer_alike() {
         }
     }
 }
+
+/// A virtual 1 GiB file: fixed-width lines, generated only as they are read.
+#[derive(Clone)]
+struct SeekCounted {
+    served: Arc<AtomicUsize>,
+}
+
+impl Replay for SeekCounted {
+    fn open(&self) -> ByteStream {
+        self.open_at(0).unwrap()
+    }
+
+    fn open_at(&self, offset: u64) -> Option<ByteStream> {
+        let served = self.served.clone();
+        Some(Box::pin(futures::stream::unfold(offset, move |offset| {
+            let served = served.clone();
+            async move {
+                let end = (offset + 4096).min(1 << 30);
+                if offset >= end {
+                    return None;
+                }
+                let bytes: Vec<_> = (offset..end)
+                    .map(|i| if i % 16 == 15 { b'\n' } else { b'x' })
+                    .collect();
+                served.fetch_add(bytes.len(), Ordering::SeqCst);
+                Some((Ok(Bytes::from(bytes)), end))
+            }
+        })))
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        Some(1 << 30)
+    }
+}
+
+struct SeekProducer(Arc<dyn Replay>);
+
+#[async_trait]
+impl Endpoint for SeekProducer {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        self.invoke_body(inv).await?.collect(usize::MAX).await
+    }
+
+    async fn invoke_body(&self, _: &Invocation<'_>) -> Result<Representation<Body>> {
+        Ok(Representation::from_body(
+            ReprType::new("text/plain"),
+            Body::Replay(self.0.clone()),
+        ))
+    }
+}
+
+#[test]
+fn tail_seeks_only_the_end_of_a_gib_body() {
+    let served = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with(SeekProducer(Arc::new(SeekCounted {
+        served: served.clone(),
+    })));
+    let answer = block_on(kernel.issue(
+        request("urn:text:tail", &[("n", "10")]),
+        &Capability::root(),
+    ))
+    .unwrap();
+    assert_eq!(answer.bytes, vec!["x".repeat(15); 10].join("\n").as_bytes());
+    assert!(
+        served.load(Ordering::SeqCst) <= 8192,
+        "tail served {} bytes of a 1 GiB body",
+        served.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn seekable_tail_reopens_for_each_reader_and_zero_polls_nothing() {
+    let served = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with(SeekProducer(Arc::new(SeekCounted {
+        served: served.clone(),
+    })));
+    let answer = block_on(kernel.issue_body(
+        request("urn:text:tail", &[("n", "10")]),
+        &Capability::root(),
+    ))
+    .unwrap();
+    let Body::Replay(replay) = answer.bytes else {
+        panic!("large input must stay replayable")
+    };
+    let first = items(Body::Once(replay.open()));
+    let second = items(Body::Once(replay.open()));
+    assert_eq!(first[0].as_ref().unwrap(), second[0].as_ref().unwrap());
+    assert_eq!(served.load(Ordering::SeqCst), 2 * 8192);
+    let zero = block_on(kernel.issue(request("urn:text:tail", &[("n", "0")]), &Capability::root()))
+        .unwrap();
+    assert!(zero.bytes.is_empty());
+    assert_eq!(served.load(Ordering::SeqCst), 2 * 8192);
+}
+
+/// A seekable producer that breaks, or ends early relative to its length hint.
+struct BrokenSeek(bool);
+
+impl Replay for BrokenSeek {
+    fn open(&self) -> ByteStream {
+        self.open_at(0).unwrap()
+    }
+
+    fn open_at(&self, _: u64) -> Option<ByteStream> {
+        Some(
+            Chunks {
+                chunks: vec![Bytes::from_static(b"x")],
+                fail: self.0,
+            }
+            .stream(),
+        )
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        Some(100)
+    }
+}
+
+#[test]
+fn seekable_tail_propagates_errors_and_refuses_short_reads() {
+    for fail in [false, true] {
+        let kernel = kernel_with(SeekProducer(Arc::new(BrokenSeek(fail))));
+        let answer = block_on(kernel.issue(request("urn:text:tail", &[]), &Capability::root()));
+        assert!(matches!(answer, Err(Error::Unavailable(_))), "{answer:?}");
+    }
+}
+
+#[derive(Clone)]
+struct SeekBytes {
+    bytes: Vec<u8>,
+    chunk: usize,
+}
+
+impl Replay for SeekBytes {
+    fn open(&self) -> ByteStream {
+        self.open_at(0).unwrap()
+    }
+
+    fn open_at(&self, offset: u64) -> Option<ByteStream> {
+        Some(Chunks::of(&self.bytes[offset as usize..], self.chunk).stream())
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        Some(self.bytes.len() as u64)
+    }
+}
+
+fn seek_kernel(bytes: &[u8], chunk: usize) -> Kernel {
+    kernel_with(SeekProducer(Arc::new(SeekBytes {
+        bytes: bytes.to_vec(),
+        chunk,
+    })))
+}
+
+#[test]
+fn seekable_tail_matches_lines_across_windows_and_chunk_boundaries() {
+    let long = format!(
+        "{}\r\n{}\nlast é\r",
+        "é".repeat(9000),
+        "x\n\r\n".repeat(5000)
+    );
+    for input in [
+        "", "\n", "\n\n", "a", "a\n", "a\r\n", "a\r\r\n", "\ra\n\n", "a\nb\r", &long,
+    ] {
+        for n in [0, 1, 2, 10, 20000] {
+            let expected = input
+                .lines()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            for chunk in [1, 113, 8192, 32768] {
+                let kernel = seek_kernel(input.as_bytes(), chunk);
+                let answer = block_on(kernel.issue(
+                    request("urn:text:tail", &[("n", &n.to_string())]),
+                    &Capability::root(),
+                ))
+                .unwrap();
+                assert_eq!(
+                    answer.bytes,
+                    expected.as_bytes(),
+                    "len={} n={n} chunk={chunk}",
+                    input.len()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn seekable_tail_validates_only_selected_lines() {
+    let input = b"\xff\nvalid\nlast\n";
+    let kernel = seek_kernel(input, 2);
+    let answer =
+        block_on(kernel.issue(request("urn:text:tail", &[("n", "2")]), &Capability::root()))
+            .unwrap();
+    assert_eq!(answer.bytes, b"valid\nlast");
+    assert!(inline("urn:text:tail", input, &[("n", "2")]).is_err());
+    for n in ["3", "4"] {
+        let result =
+            block_on(kernel.issue(request("urn:text:tail", &[("n", n)]), &Capability::root()));
+        assert!(
+            matches!(result, Err(Error::InvalidArgument { .. })),
+            "{result:?}"
+        );
+    }
+    // A non-seekable Replay still validates its entire input.
+    let kernel = kernel_with(Producer {
+        chunks: Chunks::of(input, 2),
+        replay: true,
+    });
+    assert!(
+        block_on(kernel.issue(request("urn:text:tail", &[("n", "2")]), &Capability::root(),))
+            .is_err()
+    );
+}
+
+#[test]
+fn seekable_tail_enforces_the_retained_lines_budget() {
+    // A huge earlier line is never retained or validated by the seek path.
+    let input = format!(
+        "{}\n{}\n{}\n",
+        "x".repeat(100000),
+        "a".repeat(40),
+        "b".repeat(40)
+    );
+    let kernel = seek_kernel(input.as_bytes(), 113).with_stream_memory(64, 64);
+    let answer =
+        block_on(kernel.issue(request("urn:text:tail", &[("n", "1")]), &Capability::root()))
+            .unwrap();
+    assert_eq!(answer.bytes, vec![b'b'; 40]);
+    let answer =
+        block_on(kernel.issue(request("urn:text:tail", &[("n", "2")]), &Capability::root()));
+    assert!(
+        matches!(answer, Err(Error::OverBudget { .. })),
+        "{answer:?}"
+    );
+}

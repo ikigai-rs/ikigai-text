@@ -47,7 +47,9 @@ input is answered as a stream, line by line, and never held whole:
 - `head` stops after `n` lines and drops its producer, so
   `source urn:file:big.log | urn:text:head` never reads the rest of the file;
 - `wc`, `grep`, `nl`, `rev` and `uniq` hold one line at a time;
-- `tail` holds at most `n` lines;
+- `tail` holds at most `n` lines; on a seekable body with a known length it
+  reads backwards from the end through `Replay::open_at`, reading only the tail;
+  a non-seekable body keeps the constant-memory forward scan;
 - `sort` needs every line, so it collects the input under the run's byte budget.
 
 All eight tools declare `reads_body` on their piped `in` argument (the argument
@@ -62,7 +64,11 @@ is joined first); invalid UTF-8 is refused, never replaced. A line, `tail`'s
 lines or `sort`'s input past the run's byte budget
 (`urn:cap:stream:memory:<bytes>`) ends the answer with `OverBudget`, and a
 failing input ends it with the input's error: never a well-formed shorter
-answer. Collected, the body answer equals the bytes answer for the same input.
+answer. Collected, the body answer equals the bytes answer for the same input,
+with two declared divergences: `head` does not see invalid UTF-8 after its first
+`n` lines, and `tail` on a seekable body with a known length does not see invalid
+UTF-8 before its last `n` lines. The bytes path validates the whole input and
+refuses either invalid input.
 An inline `in` is answered exactly as before.
 
 **What is cached.** A small file is: when `in` can be read again and says its

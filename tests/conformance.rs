@@ -25,6 +25,13 @@
 //! using the same space and content store as the kernel. More streaming cases
 //! live in `tests/streaming.rs`.
 //!
+//! Declared BODIES divergences (also in the crate contract and README): `head`
+//! stops before invalid UTF-8 after its first n lines; seekable, known-length
+//! `tail` skips invalid UTF-8 before its last n lines. The bytes path validates
+//! the whole input. The suite's valid fixtures still require identical answers;
+//! the tail exception is exercised in `tests/streaming.rs`, without opting
+//! either endpoint out of BODIES.
+//!
 //! No fixtures (the minimal inputs the ArgSpecs admit are valid calls), no
 //! opt-outs, no module namespace (there is no RDF face). One space declaration:
 //! `space()` is self-named `urn:iki:space:text`.
