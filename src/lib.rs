@@ -53,7 +53,11 @@
 //!
 //! A one-shot input gives a one-shot answer (never stored by the kernel); an
 //! input that can be read again ([`Body::Replay`]) gives an answer that can be
-//! read again, each reader re-reading the input. Collected, the body answer
+//! read again, each reader re-reading the input — except that over a sized
+//! input of at most [`COLLECT_BOUND`] bytes the answer is collected to bytes
+//! (ledger #2530), so the kernel's cache admits it. A streamed answer is not
+//! cached: its length is not known, and the cache's byte bound cannot admit it
+//! (`urn:kernel:uncached` says `policy`). Collected, the body answer
 //! equals the bytes answer for the same input. Because `head` stops reading, it
 //! answers over an input whose invalid UTF-8 lies past its `n` lines, as Unix
 //! `head` does; the bytes path, which is handed the input whole, refuses it.
@@ -89,6 +93,15 @@ const TEXT_PLAIN_UTF8: &str = "text/plain;charset=utf-8";
 
 /// The XSD `string` datatype IRI — the `class` of the piped input and of every
 /// free-text or enum-token argument.
+/// The largest input, in bytes, whose answer a tool collects rather than
+/// streams (ledger #2530): 1 MiB. When `in` can be read again
+/// ([`Body::Replay`]) and says its length ([`Replay::len_hint`]) is at most
+/// this, the answer is collected to bytes, under the run's byte budget, so the
+/// kernel's cache admits it. A larger input, or one whose length is not known,
+/// is answered as a stream, which the cache does not store
+/// (`urn:kernel:uncached` says `policy`).
+pub const COLLECT_BOUND: u64 = 1 << 20;
+
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// The XSD `integer` datatype IRI — the `class` of a line-count argument.
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -628,6 +641,13 @@ impl Endpoint for TextTool {
                 let bytes = inv.collect(body).await?;
                 let text_in = Splitter::decode(&bytes, 0)?;
                 return sort_str(inv, text_in).map(Representation::into_body);
+            }
+            (Some(op), Body::Replay(input))
+                if input.len_hint().is_some_and(|len| len <= COLLECT_BOUND) =>
+            {
+                // Small and sized: collect the streamed answer, so it is cached.
+                let answer = Body::replay(LinesReplay { input, op, limit });
+                Body::Bytes(inv.collect(answer).await?)
             }
             (Some(op), Body::Replay(input)) => Body::replay(LinesReplay { input, op, limit }),
             (Some(op), Body::Once(input)) => Body::Once(lines_stream(input, op, limit)),
