@@ -65,6 +65,16 @@ failing input ends it with the input's error: never a well-formed shorter
 answer. Collected, the body answer equals the bytes answer for the same input.
 An inline `in` is answered exactly as before.
 
+**What is cached.** A small file is: when `in` can be read again and says its
+length, and that length is at most `COLLECT_BOUND` (1 MiB), the tool collects
+its answer to bytes under the run's byte budget, so the kernel caches it like
+an inline answer, and `source urn:file:x | urn:text:wc` a second time is
+`[cached]`. Above the bound, or when the input's length is not known, the
+answer streams and **is not cached**: `urn:kernel:uncached` lists the step
+with `policy` (a stream of unknown length that the cache's byte bound cannot
+admit). A one-shot input gives a one-shot answer, never stored (`one-shot
+content`).
+
 Booleans take `true`/`false`; an absent flag is `false`, and any other value is
 an error (a mistyped flag never silently reads as off). `uniq` collapses only
 *adjacent* duplicates (Unix semantics) — pipe through `sort` first for a global
