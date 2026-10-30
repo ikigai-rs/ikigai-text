@@ -39,7 +39,8 @@
 //! - `head` stops after `n` lines and drops its producer, so it never reads the
 //!   rest of the input;
 //! - `wc`, `grep`, `nl`, `rev` and `uniq` hold one line at a time;
-//! - `tail` holds at most `n` lines;
+//! - `tail` holds at most `n` lines; a seekable body with a known length is read
+//!   backwards through [`Replay::open_at`], reading only its end;
 //! - `sort` needs every line, so it collects the input under the run's byte
 //!   budget ([`Invocation::collect`]).
 //!
@@ -60,7 +61,10 @@
 //! (`urn:kernel:uncached` says `policy`). Collected, the body answer
 //! equals the bytes answer for the same input. Because `head` stops reading, it
 //! answers over an input whose invalid UTF-8 lies past its `n` lines, as Unix
-//! `head` does; the bytes path, which is handed the input whole, refuses it.
+//! `head` does. Likewise, `tail` on a seekable body with a known length does not
+//! validate UTF-8 before its last `n` lines, even if those bytes share a read
+//! window with the tail. These are declared body/bytes divergences: the bytes
+//! path, which is handed the input whole, refuses either invalid input.
 //!
 //! ## ArgSpec showcase
 //!
@@ -529,8 +533,107 @@ struct LinesReplay {
 
 impl Replay for LinesReplay {
     fn open(&self) -> ByteStream {
+        if let LineOp::Tail(n) = self.op {
+            if let Some(len) = self.input.len_hint() {
+                let start = len.saturating_sub(TAIL_BLOCK);
+                if let Some(first) = self.input.open_at(start) {
+                    let input = self.input.clone();
+                    let limit = self.limit;
+                    return Box::pin(stream::once(async move {
+                        seek_tail(input, first, start, len, n, limit).await
+                    }));
+                }
+            }
+        }
         lines_stream(self.input.open(), self.op.clone(), self.limit)
     }
+}
+
+/// Read backwards in bounded windows, retaining only the requested lines.
+const TAIL_BLOCK: u64 = 8192;
+
+async fn seek_tail(
+    input: Arc<dyn Replay>,
+    mut reader: ByteStream,
+    mut start: u64,
+    mut end: u64,
+    n: usize,
+    limit: u64,
+) -> Result<Bytes> {
+    if n == 0 || end == 0 {
+        return Ok(Bytes::new());
+    }
+    let len = end;
+    let mut lines = Vec::new();
+    let mut pending = Vec::new();
+    let mut held = 0usize;
+    // Only a CR immediately before LF is stripped, as with str::lines.
+    let mut terminated = false;
+    loop {
+        let wanted = (end - start) as usize;
+        let mut block = Vec::with_capacity(wanted);
+        while block.len() < wanted {
+            let chunk = reader.next().await.ok_or_else(|| {
+                Error::Unavailable("seekable tail input ended before its stated length".into())
+            })??;
+            let take = chunk.len().min(wanted - block.len());
+            block.extend_from_slice(&chunk[..take]);
+        }
+        for (i, &byte) in block.iter().enumerate().rev() {
+            let at = start + i as u64;
+            if at == len - 1 && byte == b'\n' {
+                terminated = true;
+                continue;
+            }
+            if byte == b'\n' {
+                keep_tail_line(&mut pending, &mut lines, &mut held, at + 1, limit)?;
+                if lines.len() == n {
+                    lines.reverse();
+                    return Ok(Bytes::from(lines.join("\n")));
+                }
+                terminated = true;
+            } else {
+                if pending.is_empty() && terminated {
+                    terminated = false;
+                    if byte == b'\r' {
+                        continue;
+                    }
+                }
+                pending.push(byte);
+                if (held + pending.len()) as u64 > limit {
+                    return Err(over_budget("tail", held + pending.len(), limit));
+                }
+            }
+        }
+        if start == 0 {
+            keep_tail_line(&mut pending, &mut lines, &mut held, 0, limit)?;
+            lines.reverse();
+            return Ok(Bytes::from(lines.join("\n")));
+        }
+        end = start;
+        start = end.saturating_sub(TAIL_BLOCK);
+        reader = input
+            .open_at(start)
+            .ok_or_else(|| Error::Unavailable("tail input stopped supporting seeking".into()))?;
+    }
+}
+
+fn keep_tail_line(
+    pending: &mut Vec<u8>,
+    lines: &mut Vec<String>,
+    held: &mut usize,
+    at: u64,
+    limit: u64,
+) -> Result<()> {
+    pending.reverse();
+    let line = Splitter::decode(pending, at)?;
+    *held += line.len();
+    if *held as u64 > limit {
+        return Err(over_budget("tail", *held, limit));
+    }
+    lines.push(line.to_owned());
+    pending.clear();
+    Ok(())
 }
 
 // --- the endpoints ---------------------------------------------------------
@@ -750,7 +853,8 @@ fn tail_description() -> Description {
         .title("Last lines")
         .summary(
             "Returns the last `n` lines of the input (default 10). Streamed, it holds at \
-             most `n` lines.",
+             most `n` lines. On a seekable body with a known length it reads from the end \
+             through open_at and does not validate UTF-8 before its last `n` lines.",
         )
         .verb(Verb::Source)
         .verb(Verb::Meta)
@@ -765,7 +869,8 @@ fn tail_description() -> Description {
 }
 
 /// `tail`: the last `n` lines of the input (default 10). Streamed, it holds at
-/// most `n` lines, under the run's byte budget.
+/// most `n` lines, under the run's byte budget. A seekable body with a known
+/// length is read from its end; invalid UTF-8 before those lines is not seen.
 pub fn tail() -> TextTool {
     TextTool { tool: Tool::Tail }
 }
