@@ -121,6 +121,12 @@ let kernel = Kernel::new(Arc::new(space));
 Or pull the individual constructors (`ikigai_text::grep()`, …) and bind them at
 IRIs of your choosing — binding authority is a host concern.
 
+## Accessibility
+
+What these tools write that people read (their answers, refusals and descriptions), the rules
+they follow and the known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a
+barrier with an issue labeled `accessibility`.
+
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
