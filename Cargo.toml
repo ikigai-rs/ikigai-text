@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-text"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Unix-like text endpoints (urn:text:wc/head/tail/grep/sort/uniq/nl/rev) for ikigai — pure, cacheable, wasm-clean pipeline citizens that make the REPL a coreutils analog."
@@ -14,10 +14,12 @@ categories = ["wasm", "text-processing"]
 [dependencies]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.2.3 adds ArgSpec::reads_body: a live piped `in` reaches the tool
-# without the kernel collecting it first. This declaration changes all eight
-# text tools' contract IRIs. As a 0.x caret this also sets a ceiling (<0.3.0).
-ikigai-core = "0.2.3"
+# 0.2.3 added ArgSpec::reads_body: a live piped `in` reaches the tool without the
+# kernel collecting it first, a declaration that changed all eight text tools'
+# contract IRIs. 0.3.0 is the scoped content store (ledger #2965): held content
+# belongs to whoever delivered it, and ContentStore::put/put_replay are root-only.
+# As a 0.x caret this also sets a ceiling (<0.4.0).
+ikigai-core = "0.3.0"
 # Both already in the graph through ikigai-core: `async-trait` to implement
 # `Endpoint` (its body path, `invoke_body`), `futures-util` to build the streamed
 # answer (ledger #2275). Runtime-free, so the crate stays wasm-clean.
@@ -26,6 +28,6 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test; 0.12.0 enables BODIES and BODY-INPUTS
-# alongside the existing checks. Its core floor applies only to the test build.
-ikigai-conformance = "0.12.0"
+# The module recipe as one test; 0.14.0 is the release on the scoped content store
+# (core 0.3.0, ledger #2965). Its core floor applies only to the test build.
+ikigai-conformance = "0.14.0"

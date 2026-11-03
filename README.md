@@ -59,6 +59,10 @@ these tools without collecting the input first; `sort` still collects under
 the run's byte budget. This requires `ikigai-core` 0.2.3 and changes all eight
 tools' contract IRIs: consumers pinned to the previous contracts must update.
 
+A `b3:` content id is read under the caller's capability (`ikigai-core` 0.3.0,
+ledger #2965): the tools answer whoever delivered the content and root, and
+anyone else naming the id gets the kernel's `NotFound`, as if nothing were held.
+
 UTF-8 is decoded incrementally with std's validator (a line split across chunks
 is joined first); invalid UTF-8 is refused, never replaced. A line, `tail`'s
 lines or `sort`'s input past the run's byte budget

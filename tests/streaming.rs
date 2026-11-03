@@ -561,7 +561,12 @@ fn inline_content_id_and_attached_body_answer_alike() {
         for (tool, args) in CASES {
             let expected = inline(tool, input.as_bytes(), args).unwrap();
             let store = Arc::new(ikigai_core::MemoryContentStore::new(1024));
-            let held = store.put(Bytes::copy_from_slice(input.as_bytes())).unwrap();
+            let held = store
+                .put_for(
+                    &Capability::root(),
+                    Bytes::copy_from_slice(input.as_bytes()),
+                )
+                .unwrap();
             let kernel = Kernel::new(Arc::new(ikigai_text::space())).with_content_store(store);
             let mut read = Request::new(Verb::Source, Iri::parse(*tool).unwrap());
             for (name, value) in *args {
@@ -595,6 +600,44 @@ fn inline_content_id_and_attached_body_answer_alike() {
                 );
                 assert_eq!(attached.repr_type, content.repr_type);
             }
+        }
+    }
+}
+
+/// Held content is its deliverer's (ledger #2965): a tool reads `in` by content id under its
+/// caller's capability. Each tool's answer is cacheable, so the deliverer reads first and
+/// every other caller is then refused from a kernel that has already answered this request.
+#[test]
+fn a_content_id_answers_only_its_deliverer() {
+    let input = INPUTS[INPUTS.len() - 1].as_bytes();
+    let session = Capability::scoped(["urn:cap:read"]);
+    let alice = session.with_principal("urn:example:person:alice").unwrap();
+    let alice_elsewhere = Capability::scoped(["urn:cap:other"])
+        .with_principal("urn:example:person:alice")
+        .unwrap();
+    let bob = session.with_principal("urn:example:person:bob").unwrap();
+    for (tool, args) in CASES {
+        let expected = inline(tool, input, args).unwrap();
+        let store = Arc::new(ikigai_core::MemoryContentStore::new(1024));
+        let held = store
+            .put_for(&alice, Bytes::copy_from_slice(input))
+            .unwrap();
+        let kernel = Kernel::new(Arc::new(ikigai_text::space())).with_content_store(store);
+        let mut read = Request::new(Verb::Source, Iri::parse(*tool).unwrap())
+            .with_arg("in", ArgRef::Content(held.id()));
+        for (name, value) in *args {
+            read = read.with_arg(*name, ArgRef::Inline(value.as_bytes().to_vec()));
+        }
+        for reader in [&alice, &alice_elsewhere, &Capability::root()] {
+            let answer = block_on(kernel.issue(read.clone(), reader)).unwrap();
+            assert_eq!(answer.bytes, expected, "{tool} {args:?} as {reader:?}");
+        }
+        for reader in [&bob, &session] {
+            let refused = block_on(kernel.issue(read.clone(), reader));
+            assert!(
+                matches!(refused, Err(Error::NotFound(_))),
+                "{tool} {args:?} as {reader:?}: {refused:?}"
+            );
         }
     }
 }
