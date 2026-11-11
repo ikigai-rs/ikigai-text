@@ -175,8 +175,12 @@ const INPUTS: &[&str] = &[
     "a\n",
     "a\r\nb\r\n",
     "a\r",
+    "\r\r\n\r\n\r",
+    "a\0b\na\0b\n\0\n",
+    "e\u{301}\n\u{2003}one\u{a0}two\tthree\n",
     "x\r\ny\n\n\nz",
     "b\na\na\né\nÉté\n10\n9\na\n",
+    "1\n01\n1\nfoo\n0\nfoo\n",
     "日本語\n🦀 crab\n🦀 crab\nAé\n  spaced   words \t here\n",
 ];
 
@@ -498,6 +502,40 @@ fn a_bad_argument_is_refused_before_the_input_is_read() {
     ));
     assert!(matches!(answer, Err(Error::InvalidArgument { .. })));
     assert_eq!(polled.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn non_utf8_options_are_refused_instead_of_defaulted() {
+    let mut failures = Vec::new();
+    for (tool, name, args) in [
+        ("urn:text:head", "n", &[][..]),
+        ("urn:text:tail", "n", &[][..]),
+        ("urn:text:wc", "count", &[][..]),
+        ("urn:text:grep", "i", &[("pattern", "x")][..]),
+        ("urn:text:grep", "v", &[("pattern", "x")][..]),
+        ("urn:text:sort", "n", &[][..]),
+        ("urn:text:sort", "r", &[][..]),
+        ("urn:text:sort", "u", &[][..]),
+        ("urn:text:uniq", "c", &[][..]),
+    ] {
+        let kernel = kernel_with(Producer {
+            chunks: Chunks::of(b"x\ny", 1),
+            replay: true,
+        });
+        for input in [
+            ArgRef::Inline(b"x\ny".to_vec()),
+            ArgRef::Reference(Iri::parse(INPUT).unwrap()),
+        ] {
+            let req = request(tool, args)
+                .with_arg("in", input)
+                .with_arg(name, ArgRef::Inline(vec![0xff]));
+            let answer = block_on(kernel.issue(req, &Capability::root()));
+            if !matches!(&answer, Err(Error::InvalidArgument { name: bad, .. }) if bad == name) {
+                failures.push(format!("{tool} {name}: {answer:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// A pipe must hand head the live producer, even when collecting it would

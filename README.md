@@ -90,6 +90,9 @@ an error (a mistyped flag never silently reads as off). `uniq` collapses only
 *adjacent* duplicates (Unix semantics) — pipe through `sort` first for a global
 dedup.
 
+An optional argument defaults only when it is absent. A supplied value that cannot be read
+as UTF-8 text is refused, including flags, line counts and `wc`'s `count` option.
+
 Each endpoint authors a full self-description — an XSD `class` on every input,
 `one_of` for the enums, `default` where applicable — so that each projects to a
 well-typed, MCP-legible tool once the action manifold is projected.

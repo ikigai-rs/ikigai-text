@@ -52,6 +52,9 @@ to a terminal.
   end), `line_tools_stream_an_input_far_larger_than_the_budget` (a `sort` past the budget is
   refused), and `a_bad_argument_is_refused_before_the_input_is_read`.
 - `src/lib.rs`: `head_rejects_a_non_integer_n` and `grep_rejects_a_non_boolean_flag`.
+- `tests/streaming.rs`: `non_utf8_options_are_refused_instead_of_defaulted` checks that
+  malformed UTF-8 in every optional argument is refused and names that argument, for inline
+  and streamed input.
 
 These pin the kind of refusal and the argument it names, not the wording. **No automated
 accessibility checker, browser or assistive technology has been used on this output.**
@@ -61,8 +64,6 @@ accessibility checker, browser or assistive technology has been used on this out
 Found by reading the source on 2026-10-31, not by testing:
 
 - `sort n=true` sorts a line that is not a number as 0, with no note that it did.
-- A flag or count whose value cannot be read as inline UTF-8 text is treated as absent (off, or
-  the default), with no refusal; only a readable value that is wrong is refused.
 - The two `tail` errors (`seekable tail input ended before its stated length`, `tail input
   stopped supporting seeking`) name no input and do not say what to do.
 
@@ -87,3 +88,4 @@ if you are comfortable sharing it. Anything security-sensitive goes through
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-11 | Optional arguments with invalid UTF-8 are refused instead of silently defaulted; tested through the kernel with inline and streamed input. |
