@@ -77,7 +77,7 @@
 //! and `cacheable` (so a dependency that silently downgraded the expiry would
 //! be a red test).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -123,8 +123,8 @@ fn text(s: String) -> Representation {
 /// (case-insensitive, trimmed) → the value; anything else → an error, so a
 /// mistyped flag can't silently read as off.
 fn flag(inv: &Invocation<'_>, name: &str) -> Result<bool> {
-    match inv.inline_str(name) {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+    match optional_text(inv, name)? {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
             other => Err(Error::InvalidArgument {
@@ -132,23 +132,31 @@ fn flag(inv: &Invocation<'_>, name: &str) -> Result<bool> {
                 detail: format!("expected `true` or `false`, got {other:?}"),
             }),
         },
-        // Missing (or non-UTF-8) → treat as unset.
-        Err(_) => Ok(false),
+        None => Ok(false),
     }
 }
 
 /// Read an optional non-negative line count: absent → `default`; otherwise the
 /// parsed value, erroring on anything that isn't a non-negative integer.
 fn count_arg(inv: &Invocation<'_>, name: &str, default: usize) -> Result<usize> {
-    match inv.inline_str(name) {
-        Ok(raw) => raw
+    match optional_text(inv, name)? {
+        Some(raw) => raw
             .trim()
             .parse::<usize>()
             .map_err(|_| Error::InvalidArgument {
                 name: name.to_string(),
                 detail: format!("expected a non-negative integer, got {:?}", raw.trim()),
             }),
-        Err(_) => Ok(default),
+        None => Ok(default),
+    }
+}
+
+/// Only an absent option gets a default; an unreadable value is still invalid.
+fn optional_text<'a>(inv: &'a Invocation<'_>, name: &str) -> Result<Option<&'a str>> {
+    if inv.request.args.contains_key(name) {
+        inv.inline_str(name).map(Some)
+    } else {
+        Ok(None)
     }
 }
 
@@ -662,7 +670,7 @@ impl TextTool {
     /// The tool's arguments read, but for `in`: a [`LineOp`], or `None` for `sort`.
     fn line_op(&self, inv: &Invocation<'_>) -> Result<Option<LineOp>> {
         Ok(Some(match self.tool {
-            Tool::Wc => LineOp::Wc(match inv.inline_str("count").unwrap_or("lines") {
+            Tool::Wc => LineOp::Wc(match optional_text(inv, "count")?.unwrap_or("lines") {
                 "lines" => Count::Lines,
                 "words" => Count::Words,
                 "bytes" => Count::Bytes,
@@ -936,8 +944,14 @@ fn sort_str(inv: &Invocation<'_>, text_in: &str) -> Result<Representation> {
         lines.sort_unstable();
     }
     if unique {
-        // Sorted, so adjacent-dedup is a global dedup.
-        lines.dedup();
+        if numeric {
+            // Equal numeric keys can interleave distinct lines. Keep the first
+            // occurrence of each exact line without changing their tie order.
+            let mut seen = BTreeSet::new();
+            lines.retain(|line| seen.insert(*line));
+        } else {
+            lines.dedup();
+        }
     }
     if reverse {
         lines.reverse();
@@ -1230,6 +1244,36 @@ mod tests {
         assert!(try_run("urn:text:head", &[("in", "a"), ("n", "two")]).is_err());
     }
 
+    #[test]
+    fn head_and_tail_enforce_nonnegative_counts_without_preallocating() {
+        for tool in ["urn:text:head", "urn:text:tail"] {
+            for n in ["-1", "18446744073709551616", ""] {
+                assert!(
+                    matches!(try_run(tool, &[("in", "a\nb"), ("n", n)]),
+                        Err(Error::InvalidArgument { name, .. }) if name == "n"),
+                    "{tool} n={n:?}"
+                );
+            }
+            assert_eq!(run(tool, &[("in", "a\nb"), ("n", "0")]), "");
+            assert_eq!(
+                run(tool, &[("in", "a\nb"), ("n", &usize::MAX.to_string())]),
+                "a\nb"
+            );
+        }
+    }
+
+    #[test]
+    fn wc_counts_unicode_whitespace_nuls_and_original_bytes() {
+        let input = "é\0\u{2003}one\u{a0}two\r\nlast\r";
+        // 2 + 1 + 3 + 3 + 2 + 3 + 2 + 4 + 1 UTF-8 bytes, including CRLF.
+        for (count, expected) in [("lines", "2"), ("words", "4"), ("bytes", "21")] {
+            assert_eq!(
+                run("urn:text:wc", &[("in", input), ("count", count)]),
+                expected
+            );
+        }
+    }
+
     // ---- grep --------------------------------------------------------------
 
     #[test]
@@ -1354,6 +1398,39 @@ mod tests {
             ),
             "c\nb\na"
         );
+    }
+
+    #[test]
+    fn numeric_sort_unique_removes_duplicates_separated_by_equal_keys() {
+        for (input, expected) in [
+            ("1\n01\n1\n2", "1\n01\n2"),
+            ("foo\n0\nbar\nfoo", "foo\n0\nbar"),
+            ("foo\n\nbar\nfoo\n\n", "foo\n\nbar"),
+            (
+                "9007199254740992\n9007199254740993\n9007199254740992",
+                "9007199254740992\n9007199254740993",
+            ),
+        ] {
+            for reverse in [false, true] {
+                let expected = if reverse {
+                    expected.split('\n').rev().collect::<Vec<_>>().join("\n")
+                } else {
+                    expected.to_string()
+                };
+                assert_eq!(
+                    run(
+                        "urn:text:sort",
+                        &[
+                            ("in", input),
+                            ("n", "true"),
+                            ("u", "true"),
+                            ("r", if reverse { "true" } else { "false" })
+                        ]
+                    ),
+                    expected
+                );
+            }
+        }
     }
 
     // ---- uniq --------------------------------------------------------------
