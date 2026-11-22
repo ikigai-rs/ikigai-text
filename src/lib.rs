@@ -927,10 +927,53 @@ pub fn grep() -> TextTool {
 
 // --- sort ------------------------------------------------------------------
 
-/// A line's numeric key for `sort n=true`: the leading value, or 0 when the
-/// line does not parse as a number (the coreutils `sort -n` convention).
-fn numeric_key(line: &str) -> f64 {
-    line.trim().parse::<f64>().unwrap_or(0.0)
+struct NumericKey<'a> {
+    negative: bool,
+    integer: &'a str,
+    fraction: &'a str,
+}
+
+fn numeric_key(line: &str) -> NumericKey<'_> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let (negative, digits) = match line.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    let is_digit = |ch: char| ch.is_ascii_digit();
+    let rest = digits.trim_start_matches(is_digit);
+    let integer = digits[..digits.len() - rest.len()].trim_start_matches('0');
+    let fraction = rest
+        .strip_prefix('.')
+        .unwrap_or_default()
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('0');
+    NumericKey {
+        negative: negative && !(integer.is_empty() && fraction.is_empty()),
+        integer,
+        fraction,
+    }
+}
+
+impl NumericKey<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Integer length gives place value. Fraction strings compare directly
+        // because any missing digits are zeros and trailing zeros were removed.
+        other.negative.cmp(&self.negative).then_with(|| {
+            let magnitude = self
+                .integer
+                .len()
+                .cmp(&other.integer.len())
+                .then_with(|| self.integer.cmp(other.integer))
+                .then_with(|| self.fraction.cmp(other.fraction));
+            if self.negative {
+                magnitude.reverse()
+            } else {
+                magnitude
+            }
+        })
+    }
 }
 
 fn sort_str(inv: &Invocation<'_>, text_in: &str) -> Result<Representation> {
@@ -939,7 +982,7 @@ fn sort_str(inv: &Invocation<'_>, text_in: &str) -> Result<Representation> {
     let unique = flag(inv, "u")?;
     let mut lines: Vec<&str> = text_in.lines().collect();
     if numeric {
-        lines.sort_by(|a, b| numeric_key(a).total_cmp(&numeric_key(b)));
+        lines.sort_by(|a, b| numeric_key(a).cmp(&numeric_key(b)));
     } else {
         lines.sort_unstable();
     }
@@ -995,11 +1038,16 @@ fn sort_description() -> Description {
         .output(TEXT_PLAIN_UTF8)
 }
 
-/// `sort`: sorts the input lines. `r=true` reverses, `n=true` compares
-/// numerically (non-numeric lines sort as 0), `u=true` drops duplicates. With
-/// `u`, dedup runs after the sort, so it is global (Unix `sort -u`); ordering is
-/// sort → unique → reverse. It needs every line, so a streamed input is
-/// collected under the run's byte budget.
+/// `sort`: sorts the input lines. With `n=true`, it compares decimal prefixes
+/// exactly, skipping leading spaces and tabs. A prefix has an optional minus
+/// sign and ASCII digits, with an optional decimal point anywhere among the
+/// digits or at either end. A leading plus sign gives a zero key. Exponents,
+/// thousands separators, and other suffixes are outside the prefix. Lines
+/// without a numeric prefix sort as zero, and equal keys keep their input order.
+///
+/// `u=true` drops duplicate lines globally after sorting. `r=true` reverses
+/// the result after deduplication. A streamed input is collected under the
+/// run's byte budget.
 pub fn sort() -> TextTool {
     TextTool { tool: Tool::Sort }
 }
@@ -1369,6 +1417,51 @@ mod tests {
         assert_eq!(
             run("urn:text:sort", &[("in", "10\n9\n100\n2"), ("n", "true")]),
             "2\n9\n10\n100"
+        );
+    }
+
+    #[test]
+    fn numeric_sort_orders_large_integers_exactly() {
+        assert_eq!(
+            run(
+                "urn:text:sort",
+                &[("in", "9007199254740993\n9007199254740992"), ("n", "true")]
+            ),
+            "9007199254740992\n9007199254740993"
+        );
+    }
+
+    #[test]
+    fn numeric_sort_compares_decimals_and_preserves_ties() {
+        assert_eq!(
+            run(
+                "urn:text:sort",
+                &[
+                    (
+                        "in",
+                        "7\n1.9\n0\n007\n-2\nfoo\n-0\n-10\n1.10\nbar\n-.2\n1.1\n-0.000\n-0.03"
+                    ),
+                    ("n", "true")
+                ]
+            ),
+            "-10\n-2\n-.2\n-0.03\n0\nfoo\n-0\nbar\n-0.000\n1.10\n1.1\n1.9\n7\n007"
+        );
+    }
+
+    #[test]
+    fn numeric_sort_uses_the_leading_decimal_prefix() {
+        assert_eq!(
+            run(
+                "urn:text:sort",
+                &[
+                    (
+                        "in",
+                        "  \t2 items\n+3\n1e9\n.5 suffix\n-1,000\nNaN\ninf\n-.\n3.\n1.2.3"
+                    ),
+                    ("n", "true")
+                ]
+            ),
+            "-1,000\n+3\nNaN\ninf\n-.\n.5 suffix\n1e9\n1.2.3\n  \t2 items\n3."
         );
     }
 
