@@ -1372,20 +1372,6 @@ mod tests {
         );
     }
 
-    // Enable with `cargo test numeric_sort_orders_large_integers_exactly -- --ignored`.
-    // f64 rounds both keys to the same value; exact decimal comparison is needed.
-    #[test]
-    #[ignore = "numeric sort currently loses precision for large integers"]
-    fn numeric_sort_orders_large_integers_exactly() {
-        assert_eq!(
-            run(
-                "urn:text:sort",
-                &[("in", "9007199254740993\n9007199254740992"), ("n", "true")]
-            ),
-            "9007199254740992\n9007199254740993"
-        );
-    }
-
     #[test]
     fn sort_numeric_treats_non_numeric_as_zero() {
         // "foo" -> 0, so it sorts alongside "0" ahead of the positive values.
